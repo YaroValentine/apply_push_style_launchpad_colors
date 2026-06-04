@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
+import platform
 from typing import List, Optional
 
 HELPER_REL_PATH = Path("novation/push_playing_clip_session.py")
@@ -63,6 +65,7 @@ WRAPPER_TEMPLATE = """from __future__ import absolute_import, print_function, un
 
 import importlib.util
 from pathlib import Path
+import sys
 
 from novation.novation_base import NovationBase
 from novation.push_playing_clip_session import PushStyleSessionComponent
@@ -71,11 +74,17 @@ from novation.push_playing_clip_session import PushStyleSessionComponent
 def _load_original_module():
     module_name = __name__ + \"._original\"
     pyc_path = Path(__file__).with_suffix(\".pyc\")
-    spec = importlib.util.spec_from_file_location(module_name, str(pyc_path))
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        str(pyc_path),
+        submodule_search_locations=[str(Path(__file__).parent)],
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(\"Cannot load original bytecode module from {0}\".format(pyc_path))
 
     module = importlib.util.module_from_spec(spec)
+    # Keep the package registered so relative imports in the bytecode can resolve.
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -96,6 +105,56 @@ def create_instance(c_instance):
 """
 
 WRAPPER_MARKER = "from novation.push_playing_clip_session import PushStyleSessionComponent"
+
+
+def is_remote_scripts_root(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if not (path / "novation").is_dir():
+        return False
+    return any((child / "__init__.pyc").exists() for child in path.glob("Launchpad*") if child.is_dir())
+
+
+def detect_default_root() -> Optional[Path]:
+    candidates: List[Path] = []
+
+    env_root = os.environ.get("ABLETON_MIDI_REMOTE_SCRIPTS")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    script_path = Path(__file__).resolve()
+    candidates.extend(script_path.parents)
+
+    system = platform.system()
+    if system == "Darwin":
+        # Typical macOS app bundle location(s).
+        candidates.extend(Path("/Applications").glob("Ableton Live *.app/Contents/App-Resources/MIDI Remote Scripts"))
+    elif system == "Windows":
+        # Typical Windows install locations (Suite/Standard/Intro variants).
+        for var in ("ProgramData", "ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+            base = os.environ.get(var)
+            if not base:
+                continue
+            candidates.extend(Path(base).glob("Ableton/Live */Resources/MIDI Remote Scripts"))
+
+    seen = set()
+    valid: List[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if is_remote_scripts_root(resolved):
+            valid.append(resolved)
+
+    if not valid:
+        return None
+
+    # Prefer the newest matching install.
+    return max(valid, key=lambda p: p.stat().st_mtime)
 
 
 def detect_launchpad_dirs(root: Path) -> List[Path]:
@@ -231,8 +290,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--root",
-        default=str(Path(__file__).resolve().parents[2]),
-        help="Path to 'MIDI Remote Scripts' root",
+        default=None,
+        help=(
+            "Path to 'MIDI Remote Scripts' root. "
+            "If omitted, auto-detects from ABLETON_MIDI_REMOTE_SCRIPTS, script location, and OS install paths."
+        ),
+    )
+    parser.add_argument(
+        "--print-detected-root",
+        action="store_true",
+        help="Print the resolved root path and exit without modifying files",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without writing files")
     return parser.parse_args()
@@ -240,7 +307,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    root = Path(args.root).resolve()
+
+    if args.root:
+        root = Path(args.root).expanduser().resolve()
+    else:
+        detected = detect_default_root()
+        if detected is None:
+            print("error: could not auto-detect 'MIDI Remote Scripts' root")
+            print("hint: pass --root '/path/to/MIDI Remote Scripts' or set ABLETON_MIDI_REMOTE_SCRIPTS")
+            return 2
+        root = detected
+
+    if args.print_detected_root:
+        print(root)
+        return 0
 
     if not root.is_dir():
         print(f"error: root does not exist: {root}")
